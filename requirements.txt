@@ -1,0 +1,13 @@
+# CUDA 12.8 PyTorch wheels. For CPU-only, install torch/torchvision from https://pytorch.org/get-started/locally/ then pip install the rest of this file without the --extra-index-url line.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.9.1
+torchvision>=0.24.0
+kernels>=0.11.7
+matplotlib>=3.10.8
+numpy>=2.2.6
+pandas>=2.3.3
+pyarrow>=21.0.0
+requests>=2.32.0
+rustbpe>=0.1.0
+tiktoken>=0.11.0
