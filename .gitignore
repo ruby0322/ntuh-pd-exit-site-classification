@@ -21,3 +21,14 @@ dev/
 
 # Results file
 results.tsv
+
+# data
+dataset.zip
+dataset/
+
+# model path
+model.pt
+
+# Sweep logs / checkpoints (keep experiments/run_sweep.sh)
+experiments/*.log
+experiments/model_*.pt

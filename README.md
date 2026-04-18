@@ -20,24 +20,22 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+, a virtual environment, and (for the original autoresearch flow) a single NVIDIA GPU. Dependencies are listed in `requirements.txt`.
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -U pip
+pip install -r requirements.txt
 
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Optional — original autoresearch data + tokenizer (one-time, ~2 min)
+python prepare.py
 
-# 2. Install dependencies
-uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# Image classification training (this repo’s train.py)
+python train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+If the above commands work, your setup is ready.
 
 ## Running the agent
 
@@ -52,10 +50,10 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py       — constants, data prep + runtime utilities (do not modify)
+train.py         — model, optimizer, training loop (agent modifies this)
+program.md       — agent instructions
+requirements.txt — dependencies (pip)
 ```
 
 ## Design choices
