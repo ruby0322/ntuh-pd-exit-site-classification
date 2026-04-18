@@ -232,15 +232,52 @@ def get_model_size(model: nn.Module) -> tuple[int, int, float]:
     return param_size, buffer_size, size_all_mb
 
 
+def build_transfer_model(backbone: str, num_classes: int) -> nn.Module:
+    """Return a torchvision pretrained backbone with a fresh classification head."""
+    from torchvision import models
+
+    if backbone == "resnet50":
+        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        in_features = base.fc.in_features
+        base.fc = nn.Sequential(
+            nn.Dropout(p=0.4),
+            nn.Linear(in_features, num_classes),
+        )
+    elif backbone == "efficientnet_b3":
+        base = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
+        in_features = base.classifier[1].in_features
+        base.classifier = nn.Sequential(
+            nn.Dropout(p=0.4, inplace=True),
+            nn.Linear(in_features, num_classes),
+        )
+    elif backbone == "mobilenet_v3_large":
+        base = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+        in_features = base.classifier[-1].in_features
+        base.classifier[-1] = nn.Linear(in_features, num_classes)
+    else:
+        raise ValueError(
+            f"Unknown backbone {backbone!r}; choose from 'resnet50', 'efficientnet_b3', 'mobilenet_v3_large'"
+        )
+    return base
+
+
+# ImageNet statistics for pretrained backbones.
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
 def build_dataloaders(
     dataset_root: Path,
     batch_size: int,
     train_fraction: float,
     seed: int,
+    *,
+    imagenet_norm: bool = False,
 ) -> tuple[DataLoader, DataLoader, int, torch.Tensor]:
     # Augmented transform for training only — critical for generalisation on ~2k images.
     # Flips and colour jitter are safe for wound photography; rotation ±15° mimics
     # real capture-angle variation.
+    _norm = [trns.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD)] if imagenet_norm else []
     train_transform = trns.Compose(
         [
             trns.Resize(IMAGE_SIZE),
@@ -250,6 +287,7 @@ def build_dataloaders(
             trns.RandomRotation(15),
             trns.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
             trns.ToTensor(),
+            *_norm,
         ]
     )
     test_transform = trns.Compose(
@@ -257,6 +295,7 @@ def build_dataloaders(
             trns.Resize(IMAGE_SIZE),
             trns.CenterCrop(IMAGE_SIZE),
             trns.ToTensor(),
+            *_norm,
         ]
     )
     # Load the dataset twice with different transforms; use identical split indices
@@ -436,6 +475,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=0.0001)
+    p.add_argument(
+        "--pos-weight-boost",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra multiplier applied to the infection-positive class weight. "
+            "Useful when transfer learning improves mc_acc but misses the 9% positive class."
+        ),
+    )
     p.add_argument("--train-fraction", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42, help="RNG seed for split, torch, cuda")
     p.add_argument(
@@ -452,6 +500,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use Nesterov momentum for SGD (ignored for AdamW)",
     )
     p.add_argument("--model-out", type=Path, default=Path("model.pt"))
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default="none",
+        choices=("none", "resnet50", "efficientnet_b3", "mobilenet_v3_large"),
+        help=(
+            "Pretrained torchvision backbone (default: none = use custom myCNN). "
+            "When set, --arch is ignored and ImageNet normalisation is applied automatically."
+        ),
+    )
+    p.add_argument(
+        "--freeze-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Two-phase fine-tuning: freeze backbone for this many epochs (linear probe), "
+            "then unfreeze the full model. 0 = full fine-tune from the start."
+        ),
+    )
+    p.add_argument(
+        "--backbone-lr",
+        type=float,
+        default=0.0,
+        help=(
+            "Differential LR for pretrained backbone layers (head uses --lr). "
+            "0 (default) = same LR for all params. Ignored when --backbone none or --freeze-epochs > 0."
+        ),
+    )
     p.add_argument(
         "--patience",
         type=int,
@@ -477,6 +553,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _freeze_backbone(model: nn.Module, backbone: str) -> None:
+    """Freeze all backbone parameters; leave only the head trainable."""
+    if backbone == "resnet50":
+        for name, param in model.named_parameters():
+            param.requires_grad = "fc" in name
+    elif backbone in {"efficientnet_b3", "mobilenet_v3_large"}:
+        for name, param in model.named_parameters():
+            param.requires_grad = "classifier" in name
+
+
+def _unfreeze_all(model: nn.Module) -> None:
+    for param in model.parameters():
+        param.requires_grad = True
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -485,14 +576,27 @@ def main(argv: list[str] | None = None) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    use_pretrained = args.backbone != "none"
+
     train_loader, test_loader, num_classes, class_weights = build_dataloaders(
         args.dataset,
         args.batch_size,
         args.train_fraction,
         args.seed,
+        imagenet_norm=use_pretrained,
     )
+    if args.pos_weight_boost != 1.0:
+        class_weights[BINARY_INFECTION_CLASS] *= args.pos_weight_boost
+        print(
+            "Adjusted class-%d weight by x%.3f for binary screening emphasis"
+            % (BINARY_INFECTION_CLASS, args.pos_weight_boost),
+            flush=True,
+        )
 
-    model = myCNN(INPUT_CHANNEL, num_classes, arch=args.arch).to(device)
+    if use_pretrained:
+        model = build_transfer_model(args.backbone, num_classes).to(device)
+    else:
+        model = myCNN(INPUT_CHANNEL, num_classes, arch=args.arch).to(device)
     param_size, buffer_size, model_size_mb = get_model_size(model)
     print(f"Model parameters size: {param_size / 1024**2:.4f} MB", flush=True)
     print(f"Model buffers size: {buffer_size / 1024**2:.4f} MB", flush=True)
@@ -510,45 +614,107 @@ def main(argv: list[str] | None = None) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = ckpt_dir / (args.model_out.stem + "_best.pt")
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.SGD(
-            model.parameters(),
+    # Two-phase setup: during freeze_epochs only the head trains (lower VRAM, faster convergence).
+    # After that the backbone is unfrozen and a new optimizer is swapped in at full LR.
+    freeze_epochs = args.freeze_epochs if use_pretrained else 0
+    if freeze_epochs > 0:
+        _freeze_backbone(model, args.backbone)
+        print(f"Phase 1: backbone frozen for {freeze_epochs} epoch(s) (linear probe)", flush=True)
+
+    def _head_params(backbone: str) -> tuple[list, list]:
+        """Return (backbone_params, head_params) for differential LR."""
+        if backbone == "resnet50":
+            head = set(model.fc.parameters())
+        elif backbone in {"efficientnet_b3", "mobilenet_v3_large"}:
+            head = set(model.classifier.parameters())
+        else:
+            return list(model.parameters()), []
+        backbone_p = [p for p in model.parameters() if p not in head]
+        head_p = list(head)
+        return backbone_p, head_p
+
+    def _make_optimizer(params):
+        if args.optimizer == "adamw":
+            return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+        return torch.optim.SGD(
+            params,
             lr=args.lr,
             momentum=args.momentum,
             weight_decay=args.weight_decay,
             nesterov=args.nesterov,
         )
 
-    if args.scheduler == "plateau":
-        scheduler: torch.optim.lr_scheduler.LRScheduler | None = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=5
+    def _make_diff_optimizer():
+        """SGD/AdamW with backbone_lr and head_lr = args.lr."""
+        bb_params, hd_params = _head_params(args.backbone)
+        param_groups = [
+            {"params": bb_params, "lr": args.backbone_lr},
+            {"params": hd_params, "lr": args.lr},
+        ]
+        if args.optimizer == "adamw":
+            return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+        return torch.optim.SGD(
+            param_groups,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=args.nesterov,
         )
-    elif args.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    if use_pretrained and args.backbone_lr > 0 and freeze_epochs == 0:
+        optimizer = _make_diff_optimizer()
+        print(
+            f"Differential LR: backbone={args.backbone_lr:.2e}, head={args.lr:.2e}", flush=True
+        )
     else:
-        scheduler = None
+        optimizer = _make_optimizer(filter(lambda p: p.requires_grad, model.parameters()))
+
+    def _make_scheduler(opt, n_epochs):
+        if args.scheduler == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5)
+        if args.scheduler == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(n_epochs, 1))
+        return None
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     max_train = args.max_train_seconds if args.max_train_seconds > 0 else None
-    train_seconds, stopped_by_budget, best_epoch = train(
-        model,
-        train_loader,
-        test_loader,
-        criterion,
-        optimizer,
-        scheduler,
-        device,
-        args.epochs,
-        max_train_seconds=max_train,
-        log_every=args.log_every,
-        patience=args.patience,
-        checkpoint_path=checkpoint_path,
-    )
+
+    if freeze_epochs > 0:
+        # Phase 1: linear probe (backbone frozen)
+        sched1 = _make_scheduler(optimizer, freeze_epochs)
+        sec1, budget_hit1, _ = train(
+            model, train_loader, test_loader, criterion, optimizer, sched1, device, freeze_epochs,
+            max_train_seconds=max_train, log_every=args.log_every,
+            patience=0, checkpoint_path=checkpoint_path,
+        )
+        remaining = (max_train - sec1) if max_train else None
+        if not budget_hit1:
+            # Phase 2: unfreeze backbone, new optimizer at full LR
+            print("Phase 2: unfreezing backbone for full fine-tune", flush=True)
+            _unfreeze_all(model)
+            optimizer2 = _make_optimizer(model.parameters())
+            sched2 = _make_scheduler(optimizer2, args.epochs - freeze_epochs)
+            sec2, budget_hit2, best_epoch = train(
+                model, train_loader, test_loader, criterion, optimizer2, sched2, device,
+                args.epochs - freeze_epochs,
+                max_train_seconds=remaining, log_every=args.log_every,
+                patience=args.patience, checkpoint_path=checkpoint_path,
+            )
+            train_seconds = sec1 + sec2
+            stopped_by_budget = budget_hit1 or budget_hit2
+        else:
+            train_seconds = sec1
+            stopped_by_budget = budget_hit1
+            best_epoch = 0
+    else:
+        sched = _make_scheduler(optimizer, args.epochs)
+        train_seconds, stopped_by_budget, best_epoch = train(
+            model, train_loader, test_loader, criterion, optimizer, sched, device, args.epochs,
+            max_train_seconds=max_train, log_every=args.log_every,
+            patience=args.patience, checkpoint_path=checkpoint_path,
+        )
 
     torch.save(model, args.model_out)
     print(f"Saved model to {args.model_out}", flush=True)
@@ -571,6 +737,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"best_epoch:           {best_epoch}", flush=True)
     print(f"scheduler:            {args.scheduler}", flush=True)
     print(f"patience:             {args.patience}", flush=True)
+    print(f"backbone:             {args.backbone}", flush=True)
+    print(f"freeze_epochs:        {freeze_epochs}", flush=True)
+    print(f"backbone_lr:          {args.backbone_lr}", flush=True)
+    print(f"pos_weight_boost:     {args.pos_weight_boost}", flush=True)
 
 
 if __name__ == "__main__":
