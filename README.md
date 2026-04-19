@@ -1,6 +1,8 @@
 # autoresearch for NTUH PD exit-site classification
 
-![teaser](progress.png)
+![sample](sample.png)
+
+![teaser](teaser.png)
 
 - **`e41` result**: leveraged autoresearch to efficiently reach **96.8% infection-screening accuracy** after training for 30+ epochs, outperforming NTUH's work.
 - **Top-performing recipe**: built the top-performing model with MobileNetV3 transfer learning, differential-LR fine-tuning, and positive-class reweighting.
