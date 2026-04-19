@@ -1,26 +1,63 @@
-# autoresearch
+# autoresearch for NTUH PD exit-site classification
 
 ![teaser](progress.png)
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+This repository adapts the original autoresearch idea to a medical image-classification setting. An agent iterates on `train.py`, trains for a fixed 5-minute budget, logs the result to `results.tsv`, and keeps or discards the change based on the clinically important screening metric.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+The task is 5-class exit-site classification, but the main optimization target is **`bin_acc`**: whether the model correctly distinguishes infection-positive (`class_4`) from infection-negative (`class_0` to `class_3`). **`mc_acc`** remains a secondary metric for tie-breaks and side analysis.
+
+## Current setting
+
+- **Dataset**: ImageFolder-style dataset rooted at `./dataset`
+- **Classes**: 5 classes, with `class_4` treated as infection-positive
+- **Primary metric**: `bin_acc`
+- **Secondary metric**: `mc_acc`
+- **Training budget**: fixed **300 seconds** wall-clock per experiment
+- **Canonical image size**: `384`
+- **Loop summary artifacts**: `analysis_summary.json` and `analysis_summary.md`
+
+At the time of writing, the current screening frontier is the `e34...` configuration, which reaches **`bin_acc=0.951271`** with **`mc_acc=0.635593`**.
 
 ## How it works
 
-The repo is deliberately kept small and only really has three files that matter:
+The repo is intentionally small. These are the important files:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`prepare.py`**: shared constants, dataset validation, and the fixed evaluation harness. Do not modify it during experiments.
+- **`train.py`**: the model/training file the agent iterates on.
+- **`program.md`**: the research-loop instructions the agent follows.
+- **`results.tsv`**: append-only experiment log, kept out of git.
+- **`summarize_results.py`**: derives the current frontier and idea hints from `results.tsv`.
+- **`analysis.ipynb`**: human-facing notebook for `bin_acc`-first analysis with `mc_acc` as side context.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+The loop is:
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+1. edit `train.py`
+2. run a 5-minute experiment
+3. parse the footer metrics from stdout
+4. append a row to `results.tsv`
+5. regenerate `analysis_summary.json` and `analysis_summary.md`
+6. keep or discard the change based on the frontier rules in `program.md`
+
+## Metrics and keep rules
+
+Each result row has this schema:
+
+```tsv
+commit	mc_acc	bin_acc	memory_gb	status	description
+```
+
+The keep/discard policy is:
+
+- keep if `bin_acc` is strictly higher than the current best
+- keep if `bin_acc` ties the current best and `mc_acc` improves
+- keep if both metrics tie and the code becomes simpler
+- discard otherwise
+
+This means the loop is explicitly **screening-first**, not multiclass-first.
 
 ## Quick start
 
-**Requirements:** Python 3.10+, a virtual environment, and (for the original autoresearch flow) a single NVIDIA GPU. Dependencies are listed in `requirements.txt`.
+**Requirements:** Python `3.10`, a virtual environment, and preferably a CUDA-capable GPU for the full research loop. Dependencies live in `requirements.txt`.
 
 ```bash
 python3 -m venv .venv
@@ -28,62 +65,79 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -U pip
 pip install -r requirements.txt
 
-# Optional — original autoresearch data + tokenizer (one-time, ~2 min)
+# Validate dataset structure and sample image readability
 python prepare.py
 
-# Image classification training (this repo’s train.py)
+# Run one training job
 python train.py
+
+# Derive loop summary artifacts from results.tsv
+python summarize_results.py
 ```
 
-If the above commands work, your setup is ready.
+If `prepare.py` succeeds and `train.py` prints the metric footer, the setup is ready.
+
+## Training output
+
+`train.py` prints a machine-readable footer that the loop uses to log results:
+
+```text
+---
+mc_acc:               0.563600
+bin_acc:              0.712300
+train_seconds:        300.2
+train_stopped_budget: true
+peak_vram_mb:         1234.5
+arch:                 baseline
+optimizer:            sgd
+```
+
+The summary script turns `results.tsv` into:
+
+- `analysis_summary.json`: machine-readable frontier state for the agent
+- `analysis_summary.md`: short human-readable summary
+
+The notebook in `analysis.ipynb` visualizes the same history with `bin_acc` as the main plot and `mc_acc` as supporting context.
 
 ## Running the agent
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Point your coding agent at `program.md` and let it drive the experiment loop. A minimal prompt is:
 
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+```text
+Read program.md, set up the run, and start the next experiment loop.
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+The agent is expected to:
+
+- use `program.md` as the source of truth
+- modify only `train.py`
+- leave `prepare.py` untouched
+- update `results.tsv` after every run
+- regenerate the summary files with `python summarize_results.py`
+- use `analysis_summary.json` before choosing the next experiment
 
 ## Project structure
 
-```
-prepare.py       — constants, data prep + runtime utilities (do not modify)
-train.py         — model, optimizer, training loop (agent modifies this)
-program.md       — agent instructions
-requirements.txt — dependencies (pip)
+```text
+prepare.py            dataset validation + fixed evaluation harness
+train.py              image-classification model and training loop
+program.md            agent instructions for the research loop
+results.tsv           experiment log (ignored by git)
+summarize_results.py  frontier summarizer for the loop
+analysis.ipynb        notebook analysis of experiment history
+requirements.txt      Python dependencies
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **Single-file experimentation**: the agent only edits `train.py`, which keeps diffs reviewable.
+- **Fixed-time comparison**: every run gets the same 300-second budget, so results are comparable on the same machine.
+- **Screening-first optimization**: `bin_acc` defines the frontier; `mc_acc` is important but secondary.
+- **Derived loop memory**: `analysis_summary.json` gives the agent a compact view of the frontier, near misses, and recently bad directions.
 
-## Platform support
+## Platform notes
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
-
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
-
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
+The code will select CUDA when available and fall back to CPU otherwise, but the intended research-loop setting is a single GPU. CPU runs are useful for smoke tests, not for efficient overnight search.
 
 ## License
 
