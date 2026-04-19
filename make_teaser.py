@@ -8,13 +8,14 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from PIL import Image
+from PIL import Image, ImageOps
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
 DATASET_ROOT = Path("dataset")
-OUTPUT_PATH = Path("teaser.png")
+OUTPUT_PATH = Path("sample.png")
 SAMPLES_PER_CLASS = 5
 RANDOM_SEED = 7
+CELL_SIZE = 2.2 * 0.8
 
 
 def discover_class_images(dataset_root: Path) -> dict[str, list[Path]]:
@@ -59,28 +60,44 @@ def sample_class_images(
 
 def render_teaser(sampled: dict[str, list[Path]], output_path: Path) -> None:
     class_names = list(sampled)
-    rows = max(len(paths) for paths in sampled.values())
-    cols = len(class_names)
+    rows = len(class_names)
+    cols = max(len(paths) for paths in sampled.values())
 
     fig, axes = plt.subplots(
         rows,
         cols,
-        figsize=(cols * 2.2, rows * 2.2),
+        figsize=(cols * CELL_SIZE, rows * CELL_SIZE),
         dpi=200,
         squeeze=False,
+        gridspec_kw={"hspace": 0.03, "wspace": 0.03},
     )
 
-    for col, class_name in enumerate(class_names):
-        for row, image_path in enumerate(sampled[class_name]):
+    for row, class_name in enumerate(class_names):
+        for col, image_path in enumerate(sampled[class_name]):
             ax = axes[row, col]
             with Image.open(image_path) as img:
-                ax.imshow(img.convert("RGB"))
+                square = ImageOps.fit(
+                    img.convert("RGB"),
+                    (256, 256),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+                ax.imshow(square)
             ax.set_axis_off()
-            if row == 0:
-                ax.set_title(class_name, fontsize=11, pad=10)
+            if col == 0:
+                ax.text(
+                    -0.08,
+                    0.5,
+                    class_name,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="center",
+                    fontsize=11,
+                    fontweight="bold",
+                )
 
     fig.suptitle("NTUH PD exit-site dataset samples", fontsize=14, y=0.995)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.14, right=0.995, top=0.96, bottom=0.01)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
