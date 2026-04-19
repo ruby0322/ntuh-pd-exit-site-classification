@@ -12,6 +12,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — shared constants (`TIME_BUDGET`, `IMAGE_SIZE`, `BINARY_INFECTION_CLASS`) and dataset validation. Run once to confirm data is healthy; do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `summarize_results.py` — derives the current screening frontier and next-step hints from `results.tsv`.
 4. **Verify data exists**: Run `python prepare.py` to confirm `./dataset/` has the expected 5-class ImageFolder layout and all images are readable.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
@@ -99,6 +100,28 @@ c3d4e5f	0.580000	0.822000	0.2	discard	lite arch — bin_acc regression vs best
 d4e5f6g	0.000000	0.000000	0.0	crash	doubled width (OOM)
 ```
 
+## Loop summary artifact
+
+After every update to `results.tsv`, regenerate the derived analysis files:
+
+```bash
+python summarize_results.py
+```
+
+This writes:
+
+- `analysis_summary.json` — machine-readable state for the agent
+- `analysis_summary.md` — short human-readable brief
+
+The JSON is the one you should read before choosing the next experiment. Use it to:
+
+- identify the current screening frontier
+- spot promising near-miss runs with high `mc_acc`
+- avoid repeating losing regions of the search space without a new independent idea
+- prefer single-axis changes around the current best recipe
+
+Do not commit `results.tsv`, `analysis_summary.json`, or `analysis_summary.md`.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
@@ -106,17 +129,19 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 LOOP FOREVER:
 
 1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment in the **foreground** so logs stay visible: `python3 train.py` (venv activated). Optional: `python3 train.py 2>&1 | tee run.log` if you want a file **and** a live stream — do **not** use `> run.log` alone, which hides output.
-5. Read out the results from the footer (or from `run.log` if you used `tee`).
-6. If the run crashed, read the traceback from the terminal (or `tail -n 80 run.log` if you captured output). If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. Apply the **keep/discard rules** from the "Logging results" section:
+2. Read `analysis_summary.json` if it exists. Use it to choose the next experiment from the current frontier, promising near misses, or one new orthogonal idea.
+3. Tune `train.py` with an experimental idea by directly hacking the code.
+4. git commit
+5. Run the experiment in the **foreground** so logs stay visible: `python3 train.py` (venv activated). Optional: `python3 train.py 2>&1 | tee run.log` if you want a file **and** a live stream — do **not** use `> run.log` alone, which hides output.
+6. Read out the results from the footer (or from `run.log` if you used `tee`).
+7. If the run crashed, read the traceback from the terminal (or `tail -n 80 run.log` if you captured output). If you can't get things to work after more than a few attempts, give up.
+8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+9. Regenerate the derived summaries with `python summarize_results.py`
+10. Apply the **keep/discard rules** from the "Logging results" section:
    - **keep** → the branch advances; keep the git commit and continue from here
    - **discard** → `git reset --hard HEAD~1` to revert to the previous commit, then try a different idea
    - **crash** → fix if trivial, otherwise discard and revert
-9. The new "current best" after a keep is the bin_acc (and mc_acc tie-break) of that commit
+11. The new "current best" after a keep is the bin_acc (and mc_acc tie-break) of that commit, and `analysis_summary.json` becomes the starting point for the next loop iteration
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 

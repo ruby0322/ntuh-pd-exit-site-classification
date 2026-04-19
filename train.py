@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as trns
 from torchvision import datasets
 from torch.utils.data import DataLoader
@@ -221,6 +222,69 @@ class myCNN(nn.Module):
         return x
 
 
+class EvalTTAWrapper(nn.Module):
+    """Wrap a model and average logits over horizontal-flip TTA at eval time."""
+
+    def __init__(self, model: nn.Module, *, hflip: bool = False):
+        super().__init__()
+        self.model = model
+        self.hflip = hflip
+
+    def forward(self, x):
+        logits = self.model(x)
+        if self.training or not self.hflip:
+            return logits
+        flipped_logits = self.model(torch.flip(x, dims=[3]))
+        return 0.5 * (logits + flipped_logits)
+
+
+class BinaryScreeningLoss(nn.Module):
+    """Collapse 5-class logits into infection-vs-noninfection grouped logits."""
+
+    def __init__(self, infection_class: int, binary_class_weights: torch.Tensor | None = None):
+        super().__init__()
+        self.infection_class = infection_class
+        if binary_class_weights is not None:
+            self.register_buffer("binary_class_weights", binary_class_weights.clone().detach())
+        else:
+            self.binary_class_weights = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        neg_logits = torch.cat(
+            [logits[:, : self.infection_class], logits[:, self.infection_class + 1 :]],
+            dim=1,
+        )
+        grouped_logits = torch.stack(
+            [
+                torch.logsumexp(neg_logits, dim=1),
+                logits[:, self.infection_class],
+            ],
+            dim=1,
+        )
+        binary_targets = (targets == self.infection_class).long()
+        return F.cross_entropy(grouped_logits, binary_targets, weight=self.binary_class_weights)
+
+
+class MulticlassWithBinaryAuxLoss(nn.Module):
+    """Primary 5-class CE with a small auxiliary binary screening term."""
+
+    def __init__(
+        self,
+        multiclass_loss: nn.Module,
+        binary_loss: nn.Module,
+        aux_weight: float,
+    ):
+        super().__init__()
+        self.multiclass_loss = multiclass_loss
+        self.binary_loss = binary_loss
+        self.aux_weight = aux_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        mc = self.multiclass_loss(logits, targets)
+        bin_loss = self.binary_loss(logits, targets)
+        return mc + self.aux_weight * bin_loss
+
+
 def get_model_size(model: nn.Module) -> tuple[int, int, float]:
     param_size = 0
     for param in model.parameters():
@@ -232,7 +296,7 @@ def get_model_size(model: nn.Module) -> tuple[int, int, float]:
     return param_size, buffer_size, size_all_mb
 
 
-def build_transfer_model(backbone: str, num_classes: int) -> nn.Module:
+def build_transfer_model(backbone: str, num_classes: int, dropout_p: float) -> nn.Module:
     """Return a torchvision pretrained backbone with a fresh classification head."""
     from torchvision import models
 
@@ -240,19 +304,20 @@ def build_transfer_model(backbone: str, num_classes: int) -> nn.Module:
         base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         in_features = base.fc.in_features
         base.fc = nn.Sequential(
-            nn.Dropout(p=0.4),
+            nn.Dropout(p=dropout_p),
             nn.Linear(in_features, num_classes),
         )
     elif backbone == "efficientnet_b3":
         base = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
         in_features = base.classifier[1].in_features
         base.classifier = nn.Sequential(
-            nn.Dropout(p=0.4, inplace=True),
+            nn.Dropout(p=dropout_p, inplace=True),
             nn.Linear(in_features, num_classes),
         )
     elif backbone == "mobilenet_v3_large":
         base = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
         in_features = base.classifier[-1].in_features
+        base.classifier[-2] = nn.Dropout(p=dropout_p, inplace=True)
         base.classifier[-1] = nn.Linear(in_features, num_classes)
     else:
         raise ValueError(
@@ -273,23 +338,28 @@ def build_dataloaders(
     seed: int,
     *,
     imagenet_norm: bool = False,
-) -> tuple[DataLoader, DataLoader, int, torch.Tensor]:
+    train_vertical_flip: bool = True,
+) -> tuple[DataLoader, DataLoader, int, torch.Tensor, torch.Tensor]:
     # Augmented transform for training only — critical for generalisation on ~2k images.
     # Flips and colour jitter are safe for wound photography; rotation ±15° mimics
     # real capture-angle variation.
     _norm = [trns.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD)] if imagenet_norm else []
-    train_transform = trns.Compose(
+    train_tfms: list[nn.Module] = [
+        trns.Resize(IMAGE_SIZE),
+        trns.CenterCrop(IMAGE_SIZE),
+        trns.RandomHorizontalFlip(),
+    ]
+    if train_vertical_flip:
+        train_tfms.append(trns.RandomVerticalFlip())
+    train_tfms.extend(
         [
-            trns.Resize(IMAGE_SIZE),
-            trns.CenterCrop(IMAGE_SIZE),
-            trns.RandomHorizontalFlip(),
-            trns.RandomVerticalFlip(),
             trns.RandomRotation(15),
             trns.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
             trns.ToTensor(),
             *_norm,
         ]
     )
+    train_transform = trns.Compose(train_tfms)
     test_transform = trns.Compose(
         [
             trns.Resize(IMAGE_SIZE),
@@ -318,24 +388,39 @@ def build_dataloaders(
     targets = torch.tensor(full_train_ds.targets)
     counts  = torch.bincount(targets, minlength=num_classes).float()
     class_weights = (n / (num_classes * counts))
+    binary_counts = torch.tensor(
+        [
+            counts.sum() - counts[BINARY_INFECTION_CLASS],
+            counts[BINARY_INFECTION_CLASS],
+        ],
+        dtype=torch.float32,
+    )
+    binary_class_weights = n / (2 * binary_counts)
 
     train_loader = DataLoader(data_train, batch_size=batch_size, shuffle=True)
     test_loader  = DataLoader(data_test,  batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader, num_classes, class_weights
+    return train_loader, test_loader, num_classes, class_weights, binary_class_weights
 
 
-def _val_accuracy(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
-    """Return fraction of correct predictions on *loader* (no grad)."""
+def _val_metrics(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+    """Return (multiclass_acc, binary_acc) on *loader* (no grad)."""
     model.eval()
-    correct = total = 0
+    correct = bin_correct = total = 0
+    infection_class = BINARY_INFECTION_CLASS
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device).float(), y.to(device)
             preds = model(x).argmax(dim=1)
             correct += (preds == y).sum().item()
+            bin_ok = ((y == infection_class) & (preds == infection_class)) | (
+                (y != infection_class) & (preds != infection_class)
+            )
+            bin_correct += bin_ok.sum().item()
             total += y.size(0)
     model.train()
-    return correct / total if total > 0 else 0.0
+    if total == 0:
+        return 0.0, 0.0
+    return correct / total, bin_correct / total
 
 
 def train(
@@ -352,6 +437,7 @@ def train(
     log_every: int,
     patience: int,
     checkpoint_path: Path,
+    monitor_metric: str,
 ) -> tuple[float, bool, int]:
     """Train until ``num_epoch`` epochs or ``max_train_seconds`` elapses.
 
@@ -366,7 +452,7 @@ def train(
     deadline = (t_start + max_train_seconds) if max_train_seconds and max_train_seconds > 0 else None
     stopped_by_budget = False
 
-    best_val_acc: float = -1.0
+    best_metric: float = -1.0
     best_epoch: int = 0
     epochs_no_improve: int = 0
 
@@ -407,36 +493,38 @@ def train(
                 )
 
         avg_loss = sum(losses) / len(losses) if losses else float("nan")
-        val_acc = _val_accuracy(model, val_loader, device)
+        val_acc, val_bin_acc = _val_metrics(model, val_loader, device)
+        monitored_value = val_bin_acc if monitor_metric == "bin_acc" else val_acc
 
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_acc)
+                scheduler.step(monitored_value)
             else:
                 scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
-            "Epoch %d | Loss %6.4f | Val-Acc %6.4f | LR %.2e"
-            % (epoch, avg_loss, val_acc, current_lr),
+            "Epoch %d | Loss %6.4f | Val-Acc %6.4f | Val-Bin %6.4f | LR %.2e"
+            % (epoch, avg_loss, val_acc, val_bin_acc, current_lr),
             flush=True,
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if monitored_value > best_metric:
+            best_metric = monitored_value
             best_epoch = epoch
             epochs_no_improve = 0
             torch.save(model.state_dict(), checkpoint_path)
             print(
-                "  ↑ New best val-acc %.4f — checkpoint saved to %s" % (val_acc, checkpoint_path),
+                "  ↑ New best %s %.4f — checkpoint saved to %s"
+                % (monitor_metric, monitored_value, checkpoint_path),
                 flush=True,
             )
         else:
             epochs_no_improve += 1
             if patience > 0 and epochs_no_improve >= patience:
                 print(
-                    "Early stopping: no val-acc improvement for %d epochs (best %.4f at epoch %d)"
-                    % (patience, best_val_acc, best_epoch),
+                    "Early stopping: no %s improvement for %d epochs (best %.4f at epoch %d)"
+                    % (monitor_metric, patience, best_metric, best_epoch),
                     flush=True,
                 )
                 break
@@ -447,7 +535,7 @@ def train(
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
         print(
-            "Restored best weights from epoch %d (val-acc %.4f)" % (best_epoch, best_val_acc),
+            "Restored best weights from epoch %d (%s %.4f)" % (best_epoch, monitor_metric, best_metric),
             flush=True,
         )
 
@@ -476,6 +564,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=0.0001)
     p.add_argument(
+        "--transfer-dropout",
+        type=float,
+        default=0.4,
+        help="Dropout probability used in pretrained backbone classification head.",
+    )
+    p.add_argument(
+        "--loss-mode",
+        type=str,
+        default="multiclass",
+        choices=("multiclass", "binary_grouped", "multiclass_binary_aux"),
+        help=(
+            "Training loss: standard 5-class cross entropy, grouped infection-vs-noninfection "
+            "loss, or CE plus a small grouped-binary auxiliary loss."
+        ),
+    )
+    p.add_argument(
+        "--binary-aux-weight",
+        type=float,
+        default=0.25,
+        help="Weight for grouped binary auxiliary loss when --loss-mode multiclass_binary_aux.",
+    )
+    p.add_argument(
         "--pos-weight-boost",
         type=float,
         default=1.0,
@@ -483,6 +593,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Extra multiplier applied to the infection-positive class weight. "
             "Useful when transfer learning improves mc_acc but misses the 9% positive class."
         ),
+    )
+    p.add_argument(
+        "--disable-vertical-flip",
+        action="store_true",
+        help="Disable RandomVerticalFlip in training augmentation.",
     )
     p.add_argument("--train-fraction", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42, help="RNG seed for split, torch, cuda")
@@ -529,6 +644,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--eval-hflip-tta",
+        action="store_true",
+        help="At evaluation time, average logits over original and horizontally flipped views.",
+    )
+    p.add_argument(
         "--patience",
         type=int,
         default=15,
@@ -555,6 +675,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _freeze_backbone(model: nn.Module, backbone: str) -> None:
     """Freeze all backbone parameters; leave only the head trainable."""
+    model = _unwrap_model(model)
     if backbone == "resnet50":
         for name, param in model.named_parameters():
             param.requires_grad = "fc" in name
@@ -568,6 +689,10 @@ def _unfreeze_all(model: nn.Module) -> None:
         param.requires_grad = True
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.model if isinstance(model, EvalTTAWrapper) else model
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -578,15 +703,17 @@ def main(argv: list[str] | None = None) -> None:
 
     use_pretrained = args.backbone != "none"
 
-    train_loader, test_loader, num_classes, class_weights = build_dataloaders(
+    train_loader, test_loader, num_classes, class_weights, binary_class_weights = build_dataloaders(
         args.dataset,
         args.batch_size,
         args.train_fraction,
         args.seed,
         imagenet_norm=use_pretrained,
+        train_vertical_flip=not args.disable_vertical_flip,
     )
     if args.pos_weight_boost != 1.0:
         class_weights[BINARY_INFECTION_CLASS] *= args.pos_weight_boost
+        binary_class_weights[1] *= args.pos_weight_boost
         print(
             "Adjusted class-%d weight by x%.3f for binary screening emphasis"
             % (BINARY_INFECTION_CLASS, args.pos_weight_boost),
@@ -594,9 +721,11 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     if use_pretrained:
-        model = build_transfer_model(args.backbone, num_classes).to(device)
+        model = build_transfer_model(args.backbone, num_classes, args.transfer_dropout).to(device)
     else:
         model = myCNN(INPUT_CHANNEL, num_classes, arch=args.arch).to(device)
+    if args.eval_hflip_tta:
+        model = EvalTTAWrapper(model, hflip=True).to(device)
     param_size, buffer_size, model_size_mb = get_model_size(model)
     print(f"Model parameters size: {param_size / 1024**2:.4f} MB", flush=True)
     print(f"Model buffers size: {buffer_size / 1024**2:.4f} MB", flush=True)
@@ -623,10 +752,11 @@ def main(argv: list[str] | None = None) -> None:
 
     def _head_params(backbone: str) -> tuple[list, list]:
         """Return (backbone_params, head_params) for differential LR."""
+        base_model = _unwrap_model(model)
         if backbone == "resnet50":
-            head = set(model.fc.parameters())
+            head = set(base_model.fc.parameters())
         elif backbone in {"efficientnet_b3", "mobilenet_v3_large"}:
-            head = set(model.classifier.parameters())
+            head = set(base_model.classifier.parameters())
         else:
             return list(model.parameters()), []
         backbone_p = [p for p in model.parameters() if p not in head]
@@ -660,7 +790,28 @@ def main(argv: list[str] | None = None) -> None:
             nesterov=args.nesterov,
         )
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    multiclass_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    binary_criterion = BinaryScreeningLoss(BINARY_INFECTION_CLASS, binary_class_weights.to(device))
+
+    if args.loss_mode == "binary_grouped":
+        criterion = binary_criterion
+        monitor_metric = "bin_acc"
+        print("Training objective: grouped binary infection-vs-noninfection loss", flush=True)
+    elif args.loss_mode == "multiclass_binary_aux":
+        criterion = MulticlassWithBinaryAuxLoss(
+            multiclass_criterion,
+            binary_criterion,
+            args.binary_aux_weight,
+        )
+        monitor_metric = "mc_acc"
+        print(
+            "Training objective: multiclass CE + %.3f * grouped binary auxiliary loss"
+            % args.binary_aux_weight,
+            flush=True,
+        )
+    else:
+        criterion = multiclass_criterion
+        monitor_metric = "mc_acc"
     if use_pretrained and args.backbone_lr > 0 and freeze_epochs == 0:
         optimizer = _make_diff_optimizer()
         print(
@@ -687,7 +838,7 @@ def main(argv: list[str] | None = None) -> None:
         sec1, budget_hit1, _ = train(
             model, train_loader, test_loader, criterion, optimizer, sched1, device, freeze_epochs,
             max_train_seconds=max_train, log_every=args.log_every,
-            patience=0, checkpoint_path=checkpoint_path,
+            patience=0, checkpoint_path=checkpoint_path, monitor_metric=monitor_metric,
         )
         remaining = (max_train - sec1) if max_train else None
         if not budget_hit1:
@@ -700,7 +851,7 @@ def main(argv: list[str] | None = None) -> None:
                 model, train_loader, test_loader, criterion, optimizer2, sched2, device,
                 args.epochs - freeze_epochs,
                 max_train_seconds=remaining, log_every=args.log_every,
-                patience=args.patience, checkpoint_path=checkpoint_path,
+                patience=args.patience, checkpoint_path=checkpoint_path, monitor_metric=monitor_metric,
             )
             train_seconds = sec1 + sec2
             stopped_by_budget = budget_hit1 or budget_hit2
@@ -713,7 +864,7 @@ def main(argv: list[str] | None = None) -> None:
         train_seconds, stopped_by_budget, best_epoch = train(
             model, train_loader, test_loader, criterion, optimizer, sched, device, args.epochs,
             max_train_seconds=max_train, log_every=args.log_every,
-            patience=args.patience, checkpoint_path=checkpoint_path,
+            patience=args.patience, checkpoint_path=checkpoint_path, monitor_metric=monitor_metric,
         )
 
     torch.save(model, args.model_out)
@@ -741,6 +892,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"freeze_epochs:        {freeze_epochs}", flush=True)
     print(f"backbone_lr:          {args.backbone_lr}", flush=True)
     print(f"pos_weight_boost:     {args.pos_weight_boost}", flush=True)
+    print(f"transfer_dropout:     {args.transfer_dropout}", flush=True)
+    print(f"loss_mode:            {args.loss_mode}", flush=True)
+    print(f"binary_aux_weight:    {args.binary_aux_weight}", flush=True)
+    print(f"train_vflip:          {str(not args.disable_vertical_flip).lower()}", flush=True)
+    print(f"eval_hflip_tta:       {str(args.eval_hflip_tta).lower()}", flush=True)
 
 
 if __name__ == "__main__":

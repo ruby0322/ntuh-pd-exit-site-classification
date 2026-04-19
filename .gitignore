@@ -21,6 +21,8 @@ dev/
 
 # Results file
 results.tsv
+analysis_summary.json
+analysis_summary.md
 
 # data
 dataset.zip
