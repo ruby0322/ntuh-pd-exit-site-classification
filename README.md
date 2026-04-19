@@ -1,5 +1,7 @@
 # autoresearch for NTUH PD exit-site classification
 
+Model checkpoint on Hugging Face: [ruby0322/pd-exit-site-classification](https://huggingface.co/ruby0322/pd-exit-site-classification). You can download the model here.
+
 ![sample](sample.png)
 
 ![teaser](progress.png)
