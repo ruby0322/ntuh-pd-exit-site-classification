@@ -2,9 +2,8 @@
 
 ![teaser](progress.png)
 
-This repository adapts the original autoresearch idea to a medical image-classification setting. An agent iterates on `train.py`, trains for a fixed 5-minute budget, logs the result to `results.tsv`, and keeps or discards the change based on the clinically important screening metric.
-
-The task is 5-class exit-site classification, but the main optimization target is **`bin_acc`**: whether the model correctly distinguishes infection-positive (`class_4`) from infection-negative (`class_0` to `class_3`). **`mc_acc`** remains a secondary metric for tie-breaks and side analysis.
+- **`e41` result**: leveraged autoresearch to efficiently reach **96.8% infection-screening accuracy**, outperforming NTUH's work.
+- **Top-performing recipe**: built the top-performing model with MobileNetV3 transfer learning, differential-LR fine-tuning, and positive-class reweighting.
 
 ## Current setting
 
